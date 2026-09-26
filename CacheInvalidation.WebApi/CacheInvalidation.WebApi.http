@@ -1,6 +1,22 @@
-@CacheInvalidation.WebApi_HostAddress = http://localhost:5070
+# Both instances are started by the Aspire AppHost.
+@instance1 = https://localhost:5001
+@instance2 = https://localhost:5002
+@key = my-key
 
-GET {{CacheInvalidation.WebApi_HostAddress}}/weatherforecast/
+### 1. First read on instance 1: cache miss (~3 s), GeneratedBy = webapi1
+GET {{instance1}}/data/{{key}}
 Accept: application/json
 
-###
+### 2. Read on instance 2: served from L2 (Garnet), GeneratedBy = webapi1
+GET {{instance2}}/data/{{key}}
+Accept: application/json
+
+### 3. Invalidate on instance 1: removed from L2, and from the L1 of instance 2 through the backplane
+DELETE {{instance1}}/data/{{key}}
+
+### 4. Read on instance 2: cache miss again, GeneratedBy = webapi2
+GET {{instance2}}/data/{{key}}
+Accept: application/json
+
+### Soft invalidation: expired everywhere, but kept as a fail-safe fallback
+POST {{instance1}}/data/{{key}}/expire

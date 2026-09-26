@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Build
+        run: dotnet build CacheInvalidation.slnx --configuration Release
+
+      # Docker is available on ubuntu-latest: the end-to-end Aspire test runs against a real Garnet container.
+      - name: Test
+        run: dotnet test --solution CacheInvalidation.slnx --configuration Release --no-build

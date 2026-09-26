@@ -1,86 +1,78 @@
-﻿using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.Caching.StackExchangeRedis;
+using CacheInvalidation.ServiceDefaults;
+using CacheInvalidation.WebApi;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
 using Scalar.AspNetCore;
 using StackExchange.Redis;
 using ZiggyCreatures.Caching.Fusion;
 using ZiggyCreatures.Caching.Fusion.Backplane.StackExchangeRedis;
-using ZiggyCreatures.Caching.Fusion.Serialization.NewtonsoftJson;
+using ZiggyCreatures.Caching.Fusion.Serialization.SystemTextJson;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.AddServiceDefaults();
+
 builder.Services.AddOpenApi();
+builder.Services.AddProblemDetails();
 
-builder.Services.AddLogging();
+builder.Services.AddOptions<SlowDataSourceOptions>()
+    .BindConfiguration(SlowDataSourceOptions.SectionName);
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<SlowDataSource>();
 
-string redisConnection = Environment.GetEnvironmentVariable("ConnectionStrings__garnet") ?? throw new ArgumentNullException("problem with garnet");
-var redisConnectionMultiplexer = ConnectionMultiplexer.Connect(redisConnection);
+// Registers a single, shared IConnectionMultiplexer (with health check + tracing) and an IDistributedCache (L2) on top of it.
+// The "garnet" connection string is injected by the Aspire AppHost.
+builder.AddRedisDistributedCache("garnet");
 
-// TODO : docker pull ghcr.io/microsoft/garnet:latest
+// The backplane reuses that same multiplexer instead of opening its own connection.
+builder.Services.AddFusionCacheStackExchangeRedisBackplane();
+builder.Services.AddOptions<RedisBackplaneOptions>()
+    .Configure<IServiceProvider>((options, sp) =>
+        options.ConnectionMultiplexerFactory = () => Task.FromResult(sp.GetRequiredService<IConnectionMultiplexer>()));
 
-// FusionCache = HybridCache but with fail-safe mode + Auto-handling + backplane (cache invalidation propagation)
-// fail-safe mode : If redis is down, FusionCache still working with last memory entry instead of returning error
-// auto-handling : If a cache entry expires, FusionCache starts a background request to reload it while continuing to serve the old value until the new one is ready.
-// backplane : perf improvements with heavy load (batch)
-
+// FusionCache = L1 (memory) + L2 (distributed) + backplane.
+// - L1: each instance keeps its own in-memory copy for very fast reads.
+// - L2: Garnet, shared by every instance, so a value computed once is reused everywhere.
+// - Backplane: when an entry is set/removed/expired on one instance, a notification is published (Redis pub/sub)
+//   and every other instance evicts its L1 copy. This is what propagates the invalidation.
+// - Fail-safe: if the factory fails (e.g. the data source is down), the last known value is served instead of an error.
+// - Eager refresh: once an entry reaches 90% of its duration, it is refreshed in the background while the current value keeps being served.
 builder.Services.AddFusionCache()
     .WithDefaultEntryOptions(new FusionCacheEntryOptions
     {
         Duration = TimeSpan.FromMinutes(1),
-        DistributedCacheDuration = TimeSpan.FromMinutes(10)
+        DistributedCacheDuration = TimeSpan.FromMinutes(10),
+        IsFailSafeEnabled = true,
+        FailSafeMaxDuration = TimeSpan.FromHours(2),
+        FailSafeThrottleDuration = TimeSpan.FromSeconds(30),
+        EagerRefreshThreshold = 0.9f,
     })
-    .WithSerializer(
-        new FusionCacheNewtonsoftJsonSerializer()
-    )
-    .WithMemoryCache(new MemoryCache(new MemoryCacheOptions()))
-    .WithDistributedCache(new RedisCache(new RedisCacheOptions
-    {
-        Configuration = redisConnection
-    }))
-    .WithBackplane(new RedisBackplane(new RedisBackplaneOptions
-    {
-        Configuration = redisConnection
-    }));
+    .WithSerializer(new FusionCacheSystemTextJsonSerializer())
+    .WithRegisteredDistributedCache()
+    .WithRegisteredBackplane();
 
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddFusionCacheInstrumentation())
+    .WithMetrics(metrics => metrics.AddFusionCacheInstrumentation());
 
 var app = builder.Build();
+
+app.UseExceptionHandler();
 
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
     app.MapScalarApiReference(options =>
     {
-        // workaround to tell scalar to use host port instead of container port (when launching on docker mode)
-        options.Servers = Array.Empty<ScalarServer>();
+        // Behind the Aspire proxy the app listens on an internal port: let Scalar use the browser's origin instead.
+        options.Servers = [];
     });
+    app.MapGet("/", () => Results.Redirect("/scalar")).ExcludeFromDescription();
 }
-
-app.Use(async (context, next) =>
-{
-    if (context.Request.Path == "/")
-    {
-        context.Response.Redirect("/scalar/v1");
-        return;
-    }
-    await next();
-});
 
 app.UseHttpsRedirection();
 
-app.MapGet("data", async (IFusionCache cache) =>
-{
-    var data = await cache.GetOrSetAsync("my-key", async token =>
-    {
-        await Task.Delay(3000, token);
-        return new { Message = "Coucou" };
-    });
-
-    return Results.Ok(data);
-});
-
-app.MapDelete("invalidate", async (IFusionCache cache) =>
-{
-    await cache.RemoveAsync("my-key");
-    return Results.Ok("Cache invalidated on all instances");
-});
+app.MapDefaultEndpoints();
+app.MapDataEndpoints();
 
 app.Run();

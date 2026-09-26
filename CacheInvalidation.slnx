@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="CacheInvalidation.AppHost/CacheInvalidation.AppHost.csproj" />
+  <Project Path="CacheInvalidation.ServiceDefaults/CacheInvalidation.ServiceDefaults.csproj" />
+  <Project Path="CacheInvalidation.Tests/CacheInvalidation.Tests.csproj" />
+  <Project Path="CacheInvalidation.WebApi/CacheInvalidation.WebApi.csproj" />
+</Solution>
